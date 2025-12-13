@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime
+from redis_module.redis_seeder import seed_test_data
 from typing import Optional
 import redis.asyncio as aioredis
 from aiokafka.admin import NewTopic, AIOKafkaAdminClient
@@ -86,7 +86,7 @@ async def startup():
         )
         await redis_client.ping()
         logger.info("✓ Redis connected")
-        await seed_redis()
+        await seed_test_data()
 
     except Exception as e:
         logger.error(f"❌ Failed to initialize Redis: {e}")
