@@ -1,7 +1,9 @@
-import aioredis
+import json
+
+import redis
 
 
-async def seed_test_data(redis: aioredis.Redis):
+async def seed_test_data(redis: redis.Redis):
     """Seed test data for the example."""
     print("Seeding test data...")
 
