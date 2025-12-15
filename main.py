@@ -1,7 +1,7 @@
 import logging
 from typing import Optional, List
 import redis.asyncio as aioredis
-from faststream.kafka import KafkaBroker
+from faststream.kafka import KafkaBroker, KafkaMessage
 from faststream import FastStream
 from aiokafka.admin import NewTopic, AIOKafkaAdminClient
 from aiokafka.errors import TopicAlreadyExistsError
@@ -112,10 +112,10 @@ async def shutdown():
 
 
 @kafka_broker.subscriber("order.created")
-async def handle_order_created(message: OrderCreatedEvent):
+async def handle_order_created(message: OrderCreatedEvent, kafka_message: KafkaMessage):
     global order_consumer
     if order_consumer:
-        await order_consumer.process_order_created(message)
+        await order_consumer.process_order_created(message, kafka_message)
 
 
 @kafka_broker.subscriber("order.completed")

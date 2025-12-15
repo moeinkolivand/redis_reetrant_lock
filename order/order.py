@@ -350,7 +350,10 @@ class OrderProcessingService:
             logger.info(f"{owner_id} Inventory module lock released [Count: {lock_count}]")
 
     async def reserve_items(self, order_id: str, owner_id: str) -> bool:
-        """Reserve items. Lock Level: 3 (DEEPER REENTRY)"""
+        """
+        Reserve items with atomic stock check + transaction + rollback on failure.
+        Lock Level: 3 (DEEPER REENTRY)
+        """
         lock_acquired = await self.lock.acquire(f"order:{order_id}", owner_id)
         if not lock_acquired:
             return False
@@ -362,29 +365,120 @@ class OrderProcessingService:
             order = await self.get_order(order_id)
             reserved_items = []
 
-            for item in order.items:
-                product_key = f"product:{item['product_id']}"
-                stock = await self.redis.get(product_key)
+            successfully_reserved = []
 
-                if stock and int(stock) >= item["quantity"]:
-                    await self.redis.decrby(product_key, item["quantity"])
-                    reserved_items.append({
-                        "product_id": item["product_id"],
-                        "quantity": item["quantity"],
-                        "reserved_at": datetime.now().isoformat()
-                    })
-                    logger.info(f"{owner_id} Reserved {item['quantity']}x {item['product_id']}")
-                else:
-                    logger.error(f"{owner_id} Insufficient stock for {item['product_id']}")
-                    return False
+            try:
+                for item in order.items:
+                    product_key = f"product:{item['product_id']}"
+                    info_key = f"product:{item['product_id']}:info"
 
-            order.inventory_info["reserved_items"] = reserved_items
-            order.inventory_info["status"] = InventoryStatus.RESERVED
-            order.add_log(f"Reserved {len(reserved_items)} items", lock_count)
-            await self.save_order(order)
+                    max_retries = 3
+                    for attempt in range(max_retries):
+                        try:
+                            async with self.redis.pipeline(transaction=True) as pipe:
+                                await pipe.watch(product_key, info_key)
 
-            logger.info(f"{owner_id} All items reserved")
-            return True
+                                stock = await pipe.get(product_key)
+
+                                if not stock:
+                                    await pipe.unwatch()
+                                    raise ValueError(f"Product {item['product_id']} not found")
+
+                                current_stock = int(stock)
+
+                                if current_stock < item["quantity"]:
+                                    await pipe.unwatch()
+                                    raise ValueError(
+                                        f"Insufficient stock for {item['product_id']}: "
+                                        f"requested {item['quantity']}, available {current_stock}"
+                                    )
+
+                                info_data = await pipe.get(info_key)
+                                pipe.multi()
+                                new_stock = current_stock - item["quantity"]
+                                await pipe.set(product_key, new_stock)
+
+                                if info_data:
+                                    info = json.loads(info_data)
+                                    info["stock"] = new_stock
+                                    await pipe.set(info_key, json.dumps(info))
+
+                                await pipe.execute()
+
+                                reservation = {
+                                    "product_id": item["product_id"],
+                                    "quantity": item["quantity"],
+                                    "reserved_at": datetime.now().isoformat(),
+                                    "previous_stock": current_stock,
+                                    "new_stock": new_stock
+                                }
+                                successfully_reserved.append(reservation)
+                                reserved_items.append({
+                                    "product_id": item["product_id"],
+                                    "quantity": item["quantity"],
+                                    "reserved_at": datetime.now().isoformat()
+                                })
+
+                                logger.info(
+                                    f"{owner_id} Reserved {item['quantity']}x {item['product_id']} "
+                                    f"(stock: {current_stock} → {new_stock})"
+                                )
+                                break  # Success, exit retry loop
+
+                        except aioredis.WatchError:
+                            if attempt < max_retries - 1:
+                                logger.warning(
+                                    f"{owner_id} Transaction conflict for {item['product_id']}, "
+                                    f"retry {attempt + 1}/{max_retries}"
+                                )
+                                await asyncio.sleep(0.01 * (attempt + 1))  # Exponential backoff
+                                continue
+                            else:
+                                raise ValueError(
+                                    f"Failed to reserve {item['product_id']} after {max_retries} attempts"
+                                )
+
+                order.inventory_info["reserved_items"] = reserved_items
+                order.inventory_info["status"] = InventoryStatus.RESERVED
+                order.add_log(f"Reserved {len(reserved_items)} items", lock_count)
+                await self.save_order(order)
+
+                logger.info(f"{owner_id} All items reserved successfully")
+                return True
+
+            except (ValueError, Exception) as e:
+                logger.error(f"{owner_id} Reservation failed: {e}")
+
+                if successfully_reserved:
+                    logger.warning(f"{owner_id} Rolling back {len(successfully_reserved)} reservations...")
+
+                    for reservation in successfully_reserved:
+                        product_key = f"product:{reservation['product_id']}"
+                        info_key = f"product:{reservation['product_id']}:info"
+
+                        try:
+                            await self.redis.incrby(product_key, reservation["quantity"])
+
+                            info_data = await self.redis.get(info_key)
+                            if info_data:
+                                info = json.loads(info_data)
+                                info["stock"] = reservation["previous_stock"]
+                                await self.redis.set(info_key, json.dumps(info))
+
+                            logger.info(
+                                f"{owner_id} Rolled back {reservation['quantity']}x "
+                                f"{reservation['product_id']} "
+                                f"(stock: {reservation['new_stock']} → {reservation['previous_stock']})"
+                            )
+                        except Exception as rollback_error:
+                            logger.error(
+                                f"{owner_id} CRITICAL: Rollback failed for {reservation['product_id']}: "
+                                f"{rollback_error}"
+                            )
+
+                    logger.info(f"{owner_id} Rollback completed")
+
+                return False
 
         finally:
             await self.lock.release(f"order:{order_id}", owner_id)
@@ -522,7 +616,6 @@ class OrderProcessingService:
         logger.info(f"{owner_id} Order finalized")
 
 
-
 async def demonstrate_nested_transaction_processing():
     """Demonstrate reentrant lock with nested transaction processing."""
 
@@ -555,9 +648,9 @@ async def demonstrate_nested_transaction_processing():
         success = await service.process_order(order.order_id, owner_id)
 
         if success:
-            logger.info(" DEMONSTRATION COMPLETED SUCCESSFULLY!")
+            logger.info("DEMONSTRATION COMPLETED SUCCESSFULLY!")
         else:
-            logger.error("\n❌ Order processing failed")
+            logger.error("\nOrder processing failed")
 
     finally:
         await redis.aclose()

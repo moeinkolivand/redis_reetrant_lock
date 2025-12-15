@@ -1,6 +1,7 @@
 import json
 from typing import List, Optional
 
+from faststream.kafka import KafkaMessage
 from pydantic import BaseModel
 import redis.asyncio as aioredis
 from faststream.kafka import KafkaBroker
@@ -48,12 +49,13 @@ class OrderConsumer:
         self.completed_topic = "order.completed"
         self.failed_topic = "order.failed"
 
-    async def process_order_created(self, message: OrderCreatedEvent):
+    async def process_order_created(self, message: OrderCreatedEvent, kafka_message: KafkaMessage | None = None):
         order_id = message.order_id
 
         logger.info(f"Processing order.created event for {order_id}")
 
-        owner_id = f"{message.user_id}"
+        partition = kafka_message.raw_message.partition if kafka_message is not None else 0
+        owner_id = f"consumer-{partition}"
 
         try:
             success = await self.service.process_order(order_id, owner_id)
