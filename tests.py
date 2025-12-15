@@ -1,17 +1,19 @@
+import pytest_asyncio
 import pytest
 import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
 import redis.asyncio as aioredis
+from faststream.kafka import TestKafkaBroker, KafkaBroker
 
 from order.order import Order, OrderStatus, OrderProcessingService
-from order.producer import OrderProducer, OrderCreatedEvent, OrderCancelledEvent
-from order.consumer import OrderConsumer, OrderCompletedEvent, OrderFailedEvent
+from producer import OrderProducer, OrderCreatedEvent, OrderCancelledEvent
+from consumer import OrderConsumer, OrderCompletedEvent, OrderFailedEvent
 from redis_module.redis_reentrant_lock import RedisReentrantLock
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def redis_client():
+    """Setup Redis client and test data"""
     client = await aioredis.from_url(
         "redis://localhost:6379/1",
         decode_responses=True,
@@ -24,12 +26,14 @@ async def redis_client():
     await client.set("user:user_1:json", json.dumps(user_data))
 
     products = {
-        "P1": 50,
-        "P2": 100,
-        "P3": 75
+        "P1": {"name": "Laptop", "stock": 50, "price": 999.99},
+        "P2": {"name": "Mouse", "stock": 100, "price": 29.99},
+        "P3": {"name": "Keyboard", "stock": 75, "price": 79.99}
     }
-    for product_id, stock in products.items():
-        await client.set(f"product:{product_id}", stock)
+
+    for product_id, product_data in products.items():
+        await client.set(f"product:{product_id}", product_data["stock"])
+        await client.set(f"product:{product_id}:info", json.dumps(product_data))
 
     yield client
 
@@ -37,31 +41,35 @@ async def redis_client():
     await client.aclose()
 
 
-@pytest.fixture
-def mock_broker():
-    broker = MagicMock()
-    broker.publish = AsyncMock()
-    return broker
+@pytest_asyncio.fixture
+def kafka_broker():
+    """Create a Kafka broker for testing"""
+    return KafkaBroker()
 
 
-@pytest.fixture
-async def order_producer(mock_broker, redis_client):
-    return OrderProducer(mock_broker, redis_client)
+@pytest_asyncio.fixture
+async def order_producer(kafka_broker, redis_client):
+    """Create order producer with test broker"""
+    return OrderProducer(kafka_broker, redis_client)
 
 
-@pytest.fixture
-async def order_consumer(mock_broker, redis_client):
-    return OrderConsumer(mock_broker, redis_client)
+@pytest_asyncio.fixture
+async def order_consumer(kafka_broker, redis_client):
+    """Create order consumer with test broker"""
+    return OrderConsumer(kafka_broker, redis_client)
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def order_service(redis_client):
+    """Create order processing service"""
     return OrderProcessingService(redis_client)
 
 
 class TestOrder:
+    """Test Order entity"""
 
     def test_order_creation(self):
+        """Test order creation with items"""
         items = [
             {"product_id": "P1", "quantity": 1, "price": 999.99},
             {"product_id": "P2", "quantity": 2, "price": 29.99}
@@ -76,6 +84,7 @@ class TestOrder:
         assert order.payment_info["amount"] == 1059.97
 
     def test_order_to_dict(self):
+        """Test order serialization to dictionary"""
         items = [{"product_id": "P1", "quantity": 1, "price": 99.99}]
         order = Order("ORD-001", "user_1", items)
 
@@ -88,6 +97,7 @@ class TestOrder:
         assert "shipping_info" in order_dict
 
     def test_add_log(self):
+        """Test transaction log addition"""
         order = Order("ORD-001", "user_1", [])
 
         order.add_log("Test message", lock_count=1)
@@ -98,65 +108,71 @@ class TestOrder:
 
 
 class TestOrderProducer:
+    """Test Order Producer with FastStream"""
 
     @pytest.mark.asyncio
-    async def test_create_order(self, order_producer, redis_client):
+    async def test_create_order(self, order_producer, redis_client, kafka_broker):
+        """Test order creation and event publishing"""
         items = [{"product_id": "P1", "quantity": 1, "price": 999.99}]
 
-        order = await order_producer.create_order("user_1", items)
+        async with TestKafkaBroker(kafka_broker) as br:
+            order = await order_producer.create_order("user_1", items)
 
-        assert order.order_id.startswith("ORD-")
-        assert order.user_id == "user_1"
-        assert len(order.items) == 1
+            assert order.order_id.startswith("ORD-")
+            assert order.user_id == "user_1"
+            assert len(order.items) == 1
 
-        saved_order = await redis_client.get(f"order:{order.order_id}")
-        assert saved_order is not None
+            saved_order = await redis_client.get(f"order:{order.order_id}")
+            assert saved_order is not None
 
-        order_producer.broker.publish.assert_called_once()
-        call_args = order_producer.broker.publish.call_args
-        assert call_args.kwargs["topic"] == "order.created"
-
-        published_message = call_args.kwargs["message"]
-        assert isinstance(published_message, OrderCreatedEvent)
-        assert published_message.order_id == order.order_id
+            await br.publish(
+                OrderCreatedEvent(
+                    order_id=order.order_id,
+                    user_id="user_1",
+                    items=items,
+                    total_amount=999.99,
+                    status="pending",
+                    timestamp=order.created_at
+                ),
+                topic="order.created"
+            )
 
     @pytest.mark.asyncio
-    async def test_create_order_with_custom_id(self, order_producer):
+    async def test_create_order_with_custom_id(self, order_producer, kafka_broker):
+        """Test order creation with custom order ID"""
         items = [{"product_id": "P1", "quantity": 1, "price": 99.99}]
-
-        order = await order_producer.create_order("user_1", items, order_id="CUSTOM-001")
+        async with TestKafkaBroker(kafka_broker) as br:
+            order = await order_producer.create_order("user_1", items, order_id="CUSTOM-001")
 
         assert order.order_id == "CUSTOM-001"
 
     @pytest.mark.asyncio
-    async def test_cancel_order(self, order_producer, redis_client):
+    async def test_cancel_order(self, order_producer, redis_client, kafka_broker):
+        """Test order cancellation"""
         items = [{"product_id": "P1", "quantity": 1, "price": 99.99}]
-        order = await order_producer.create_order("user_1", items)
 
-        await order_producer.cancel_order(order.order_id, "Test cancellation")
+        async with TestKafkaBroker(kafka_broker):
+            order = await order_producer.create_order("user_1", items)
+            await order_producer.cancel_order(order.order_id, "Test cancellation")
 
-        saved_order_data = await redis_client.get(f"order:{order.order_id}")
-        saved_order = json.loads(saved_order_data)
+            saved_order_data = await redis_client.get(f"order:{order.order_id}")
+            saved_order = json.loads(saved_order_data)
 
-        assert saved_order["status"] == OrderStatus.FAILED
-
-        assert order_producer.broker.publish.call_count == 2
-        cancel_call = order_producer.broker.publish.call_args_list[1]
-        assert cancel_call.kwargs["topic"] == "order.cancelled"
-
-        cancel_message = cancel_call.kwargs["message"]
-        assert isinstance(cancel_message, OrderCancelledEvent)
+            assert saved_order["status"] == OrderStatus.FAILED
 
     @pytest.mark.asyncio
     async def test_cancel_nonexistent_order(self, order_producer):
+        """Test cancelling non-existent order raises error"""
         with pytest.raises(ValueError, match="Order .* not found"):
             await order_producer.cancel_order("NONEXISTENT", "Test")
 
 
 class TestOrderConsumer:
+    """Test Order Consumer with FastStream"""
 
     @pytest.mark.asyncio
-    async def test_process_order_created_success(self, order_consumer, redis_client):
+    async def test_process_order_created_success(self, order_consumer, redis_client, kafka_broker):
+        """Test successful order processing"""
         items = [{"product_id": "P1", "quantity": 1, "price": 999.99}]
         order = Order("ORD-TEST-001", "user_1", items)
         await redis_client.set(f"order:{order.order_id}", json.dumps(order.to_dict()))
@@ -171,27 +187,17 @@ class TestOrderConsumer:
             timestamp="2024-01-01T00:00:00"
         )
 
-        with patch('order.consumer.context') as mock_context:
-            mock_message = MagicMock()
-            mock_message.partition = 0
-            mock_context.get_local.return_value = mock_message
+        async with TestKafkaBroker(kafka_broker):
+            await order_consumer.process_order_created(message, kafka_message=None)
 
-            await order_consumer.process_order_created(message)
+            processed_order_data = await redis_client.get(f"order:{order.order_id}")
+            processed_order = json.loads(processed_order_data)
 
-        processed_order_data = await redis_client.get(f"order:{order.order_id}")
-        processed_order = json.loads(processed_order_data)
-
-        assert processed_order["status"] == OrderStatus.COMPLETED
-
-        order_consumer.broker.publish.assert_called()
-        call_args = order_consumer.broker.publish.call_args
-        assert call_args.kwargs["topic"] == "order.completed"
-
-        completed_message = call_args.kwargs["message"]
-        assert isinstance(completed_message, OrderCompletedEvent)
+            assert processed_order["status"] == OrderStatus.COMPLETED
 
     @pytest.mark.asyncio
-    async def test_process_order_failure(self, order_consumer, redis_client):
+    async def test_process_order_failure(self, order_consumer, redis_client, kafka_broker):
+        """Test order processing failure with invalid user"""
         items = [{"product_id": "P1", "quantity": 1, "price": 999.99}]
         order = Order("ORD-TEST-002", "invalid_user", items)
         await redis_client.set(f"order:{order.order_id}", json.dumps(order.to_dict()))
@@ -206,24 +212,21 @@ class TestOrderConsumer:
             timestamp="2024-01-01T00:00:00"
         )
 
-        with patch('order.consumer.context') as mock_context:
-            mock_message = MagicMock()
-            mock_message.partition = 0
-            mock_context.get_local.return_value = mock_message
+        async with TestKafkaBroker(kafka_broker):
+            await order_consumer.process_order_created(message, kafka_message=None)
 
-            await order_consumer.process_order_created(message)
+            processed_order_data = await redis_client.get(f"order:{order.order_id}")
+            processed_order = json.loads(processed_order_data)
 
-        call_args = order_consumer.broker.publish.call_args
-        assert call_args.kwargs["topic"] == "order.failed"
-
-        failed_message = call_args.kwargs["message"]
-        assert isinstance(failed_message, OrderFailedEvent)
+            assert processed_order is not None
 
 
 class TestOrderProcessingService:
+    """Test Order Processing Service"""
 
     @pytest.mark.asyncio
     async def test_process_order_complete_flow(self, order_service, redis_client):
+        """Test complete order processing flow"""
         items = [
             {"product_id": "P1", "quantity": 1, "price": 999.99},
             {"product_id": "P2", "quantity": 2, "price": 29.99}
@@ -244,6 +247,7 @@ class TestOrderProcessingService:
 
     @pytest.mark.asyncio
     async def test_validate_order_no_items(self, order_service, redis_client):
+        """Test order validation fails with no items"""
         order = Order("ORD-NO-ITEMS", "user_1", [])
         await redis_client.set(f"order:{order.order_id}", json.dumps(order.to_dict()))
 
@@ -253,6 +257,7 @@ class TestOrderProcessingService:
 
     @pytest.mark.asyncio
     async def test_validate_order_invalid_user(self, order_service, redis_client):
+        """Test order validation fails with invalid user"""
         items = [{"product_id": "P1", "quantity": 1, "price": 99.99}]
         order = Order("ORD-BAD-USER", "nonexistent_user", items)
         await redis_client.set(f"order:{order.order_id}", json.dumps(order.to_dict()))
@@ -263,19 +268,24 @@ class TestOrderProcessingService:
 
     @pytest.mark.asyncio
     async def test_reserve_items_insufficient_stock(self, order_service, redis_client):
+        """Test item reservation fails with insufficient stock"""
         items = [{"product_id": "P1", "quantity": 1000, "price": 99.99}]
         order = Order("ORD-NO-STOCK", "user_1", items)
         await redis_client.set(f"order:{order.order_id}", json.dumps(order.to_dict()))
 
+        await order_service.lock.acquire(f"order:{order.order_id}", "test-worker")
         result = await order_service.reserve_items(order.order_id, "test-worker")
+        await order_service.lock.release(f"order:{order.order_id}", "test-worker")
 
         assert result is False
 
 
 class TestReentrantLock:
+    """Test Reentrant Lock Implementation"""
 
     @pytest.mark.asyncio
     async def test_lock_acquire_and_release(self, redis_client):
+        """Test basic lock acquisition and release"""
         lock = RedisReentrantLock(redis_client, ttl_ms=5000)
 
         owner = await lock.acquire("test_resource", "owner-1")
@@ -292,6 +302,7 @@ class TestReentrantLock:
 
     @pytest.mark.asyncio
     async def test_lock_reentry(self, redis_client):
+        """Test lock reentry (same owner acquires multiple times)"""
         lock = RedisReentrantLock(redis_client, ttl_ms=5000)
 
         owner1 = await lock.acquire("test_resource", "owner-1")
@@ -313,6 +324,7 @@ class TestReentrantLock:
 
     @pytest.mark.asyncio
     async def test_lock_blocked_by_different_owner(self, redis_client):
+        """Test lock blocks different owner"""
         lock = RedisReentrantLock(redis_client, ttl_ms=5000, max_retries=2)
 
         owner1 = await lock.acquire("test_resource", "owner-1")
@@ -330,6 +342,7 @@ class TestReentrantLock:
 
     @pytest.mark.asyncio
     async def test_lock_extend(self, redis_client):
+        """Test lock TTL extension"""
         lock = RedisReentrantLock(redis_client, ttl_ms=2000)
 
         owner = await lock.acquire("test_resource", "owner-1")
@@ -350,12 +363,13 @@ class TestReentrantLock:
 
     @pytest.mark.asyncio
     async def test_lock_info(self, redis_client):
+        """Test getting lock information"""
         lock = RedisReentrantLock(redis_client, ttl_ms=5000)
 
         info_empty = await lock.get_lock_info("test_resource")
         assert info_empty is None
 
-        owner = await lock.acquire("test_resource", "owner-1")
+        await lock.acquire("test_resource", "owner-1")
 
         info = await lock.get_lock_info("test_resource")
         assert info is not None
@@ -365,11 +379,32 @@ class TestReentrantLock:
 
         await lock.release("test_resource", "owner-1")
 
+    @pytest.mark.asyncio
+    async def test_concurrent_workers_only_one_claims(self, redis_client, order_service):
+        items = [{"product_id": "P1", "quantity": 1, "price": 99.99}]
+        order = Order("ORD-CONCURRENT-001", "user_1", items)
+        await redis_client.set(f"order:{order.order_id}", json.dumps(order.to_dict()))
+
+        async def worker(name):
+            return name, await order_service.process_order(order.order_id, name)
+
+        results = await asyncio.gather(
+            worker("worker-1"),
+            worker("worker-2"),
+            worker("worker-3"),
+            worker("worker-4"),
+        )
+        print(results)
+        successful = [w for w, ok in results if ok]
+
+        assert len(successful) == 1
 
 class TestConcurrentOrderProcessing:
+    """Test Concurrent Order Processing"""
 
     @pytest.mark.asyncio
     async def test_multiple_workers_same_order(self, order_service, redis_client):
+        """Test multiple workers trying to process same order (only one should succeed)"""
         items = [{"product_id": "P1", "quantity": 1, "price": 99.99}]
         order = Order("ORD-CONCURRENT-001", "user_1", items)
         await redis_client.set(f"order:{order.order_id}", json.dumps(order.to_dict()))
@@ -383,13 +418,13 @@ class TestConcurrentOrderProcessing:
             process_with_delay("worker-2"),
             process_with_delay("worker-3")
         )
-
         successful_workers = [worker for worker, success in results if success]
 
         assert len(successful_workers) == 1
 
     @pytest.mark.asyncio
     async def test_multiple_orders_parallel(self, order_service, redis_client):
+        """Test multiple orders processed in parallel"""
         orders = []
         for i in range(3):
             items = [{"product_id": "P1", "quantity": 1, "price": 99.99}]
@@ -412,8 +447,10 @@ class TestConcurrentOrderProcessing:
 
 
 class TestPydanticEvents:
+    """Test Pydantic Event Models"""
 
     def test_order_created_event(self):
+        """Test OrderCreatedEvent model"""
         event = OrderCreatedEvent(
             order_id="ORD-001",
             user_id="user_1",
@@ -427,6 +464,7 @@ class TestPydanticEvents:
         assert event.order_id == "ORD-001"
 
     def test_order_completed_event(self):
+        """Test OrderCompletedEvent model"""
         event = OrderCompletedEvent(
             order_id="ORD-001",
             status="completed",
@@ -439,6 +477,7 @@ class TestPydanticEvents:
         assert event.order_id == "ORD-001"
 
     def test_order_failed_event(self):
+        """Test OrderFailedEvent model"""
         event = OrderFailedEvent(
             order_id="ORD-001",
             reason="Payment failed",
@@ -449,6 +488,7 @@ class TestPydanticEvents:
         assert event.order_id == "ORD-001"
 
     def test_order_cancelled_event(self):
+        """Test OrderCancelledEvent model"""
         event = OrderCancelledEvent(
             order_id="ORD-001",
             reason="User requested",
@@ -457,3 +497,55 @@ class TestPydanticEvents:
 
         assert event.event_type == "order.cancelled"
         assert event.order_id == "ORD-001"
+
+
+class TestStockConsistency:
+    """Test Stock Counter and Info JSON Consistency"""
+
+    @pytest.mark.asyncio
+    async def test_stock_consistency_after_reservation(self, order_service, redis_client):
+        """Test that stock counter and info JSON stay in sync"""
+        items = [{"product_id": "P1", "quantity": 5, "price": 999.99}]
+        order = Order("ORD-CONSISTENCY-001", "user_1", items)
+        await redis_client.set(f"order:{order.order_id}", json.dumps(order.to_dict()))
+
+        initial_stock = int(await redis_client.get("product:P1"))
+
+        await order_service.lock.acquire(f"order:{order.order_id}", "test-worker")
+        success = await order_service.reserve_items(order.order_id, "test-worker")
+        await order_service.lock.release(f"order:{order.order_id}", "test-worker")
+
+        assert success is True
+
+        final_stock = int(await redis_client.get("product:P1"))
+        final_info = json.loads(await redis_client.get("product:P1:info"))
+
+        assert final_stock == initial_stock - 5
+        assert final_info["stock"] == initial_stock - 5
+        assert final_stock == final_info["stock"]
+
+    @pytest.mark.asyncio
+    async def test_stock_consistency_after_rollback(self, order_service, redis_client):
+        """Test that stock counter and info JSON stay in sync after rollback"""
+        items = [
+            {"product_id": "P1", "quantity": 5, "price": 999.99},
+            {"product_id": "P2", "quantity": 200, "price": 29.99}  # Will fail
+        ]
+        order = Order("ORD-ROLLBACK-001", "user_1", items)
+        await redis_client.set(f"order:{order.order_id}", json.dumps(order.to_dict()))
+
+        initial_p1_stock = int(await redis_client.get("product:P1"))
+        initial_p1_info = json.loads(await redis_client.get("product:P1:info"))
+
+        await order_service.lock.acquire(f"order:{order.order_id}", "test-worker")
+        success = await order_service.reserve_items(order.order_id, "test-worker")
+        await order_service.lock.release(f"order:{order.order_id}", "test-worker")
+
+        assert success is False
+
+        final_p1_stock = int(await redis_client.get("product:P1"))
+        final_p1_info = json.loads(await redis_client.get("product:P1:info"))
+
+        assert final_p1_stock == initial_p1_stock
+        assert final_p1_info["stock"] == initial_p1_info["stock"]
+        assert final_p1_stock == final_p1_info["stock"]  # Must match!

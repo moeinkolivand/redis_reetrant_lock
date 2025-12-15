@@ -142,54 +142,46 @@ class OrderProcessingService:
     async def process_order(self, order_id: str, owner_id: str) -> bool:
         """Main order processing entry point. Lock Level: 1"""
         logger.info(f"{owner_id} STARTING ORDER PROCESSING: {order_id}")
-
         lock_acquired = await self.lock.acquire(f"order:{order_id}", owner_id)
         if not lock_acquired:
             logger.error(f"{owner_id} Failed to acquire lock for order {order_id}")
             return False
-
         try:
             lock_count = await self.get_lock_count(order_id, owner_id)
             logger.info(f"{owner_id} Lock acquired [Count: {lock_count}]")
-
             order = await self.get_order(order_id)
+            if order.status != OrderStatus.PENDING:
+                logger.info(f"{owner_id} Order already processed (status: {order.status}), skipping")
+                order.add_log(f"Skipped processing by {owner_id} - status is {order.status}", lock_count)
+                await self.save_order(order)
+                return False
             order.add_log(f"Processing started by {owner_id}", lock_count)
-
             logger.info(f"{owner_id} Step 1: Validating order...")
             if not await self.validate_order(order_id, owner_id):
                 order.status = OrderStatus.FAILED
                 await self.save_order(order)
                 return False
-
             await asyncio.sleep(0.5)
-
             logger.info(f"{owner_id} Step 2: Processing payment...")
             if not await self.process_payment(order_id, owner_id, "credit_card"):
                 order.status = OrderStatus.FAILED
                 await self.save_order(order)
                 return False
-
             await asyncio.sleep(0.5)
-
             logger.info(f"{owner_id} Step 3: Updating inventory...")
             if not await self.update_inventory(order_id, owner_id):
                 order.status = OrderStatus.FAILED
                 await self.save_order(order)
                 return False
-
             await asyncio.sleep(0.5)
-
             logger.info(f"{owner_id} Step 4: Scheduling shipping...")
             if not await self.schedule_shipping(order_id, owner_id):
                 order.status = OrderStatus.FAILED
                 await self.save_order(order)
                 return False
-
             await self.finalize_order(order_id, owner_id)
-
             logger.info(f"\n{owner_id} ORDER PROCESSING COMPLETED SUCCESSFULLY")
             return True
-
         except Exception as e:
             logger.error(f"{owner_id} Error processing order: {e}")
             order = await self.get_order(order_id)
@@ -197,7 +189,6 @@ class OrderProcessingService:
             order.add_log(f"Error: {str(e)}")
             await self.save_order(order)
             return False
-
         finally:
             await self.lock.release(f"order:{order_id}", owner_id)
             lock_count = await self.get_lock_count(order_id, owner_id)

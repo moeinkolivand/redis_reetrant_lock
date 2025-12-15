@@ -90,10 +90,10 @@ The system will automatically:
 
 ```bash
 # Run complete test suite
-pytest test.py -v
+pytest tests.py -v
 
 # Run with coverage
-pytest test.py --cov=order --cov=redis_module --cov-report=html
+pytest tests.py --cov=order --cov=redis_module --cov-report=html
 ```
 
 ## 📊 Understanding the Problem
@@ -260,34 +260,34 @@ T10  | process_order() releases       |    0    | Fully released
 
 **TestOrder:** Order entity creation and serialization
 ```bash
-pytest test.py::TestOrder -v
+pytest tests.py::TestOrder -v
 ```
 
 **TestOrderProducer:** Producer creates orders and publishes events
 ```bash
-pytest test.py::TestOrderProducer -v
+pytest tests.py::TestOrderProducer -v
 ```
 
 **TestOrderConsumer:** Consumer processes events correctly
 ```bash
-pytest test.py::TestOrderConsumer -v
+pytest tests.py::TestOrderConsumer -v
 ```
 
 **TestReentrantLock:** Lock mechanics and reentry behavior
 ```bash
-pytest test.py::TestReentrantLock -v
+pytest tests.py::TestReentrantLock -v
 ```
 
 ### Integration Tests
 
 **TestOrderProcessingService:** Complete order flow with all steps
 ```bash
-pytest test.py::TestOrderProcessingService -v
+pytest tests.py::TestOrderProcessingService -v
 ```
 
 **TestConcurrentOrderProcessing:** Multiple workers, same order
 ```bash
-pytest test.py::TestConcurrentOrderProcessing -v
+pytest tests.py::TestConcurrentOrderProcessing -v
 ```
 
 ### Expected Test Results
