@@ -1,7 +1,7 @@
 import uuid
 import json
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 from pydantic import BaseModel, Field
 import redis.asyncio as aioredis
 from faststream.kafka import KafkaBroker
@@ -16,7 +16,7 @@ class OrderCreatedEvent(BaseModel):
     event_type: str = Field(default="order.created")
     order_id: str
     user_id: str
-    items: list[dict]
+    items: List[dict]
     total_amount: float
     status: str
     timestamp: str
@@ -39,7 +39,7 @@ class OrderProducer:
     async def create_order(
             self,
             user_id: str,
-            items: list[dict],
+            items: List[dict],
             order_id: Optional[str] = None
     ) -> Order:
         if not order_id:
@@ -71,7 +71,7 @@ class OrderProducer:
         )
 
         await self.broker.publish(
-            message=event,
+            message=event.model_dump(),
             topic=self.topic,
             key=order.order_id.encode()
         )
@@ -105,3 +105,32 @@ class OrderProducer:
         )
 
         logger.info(f"Order {order_id} cancelled: {reason}")
+
+
+
+async def main():
+    redis = aioredis.Redis(host='localhost', port=6379, db=0)
+    KAFKA_BROKERS = ["localhost:9092", "localhost:9094", "localhost:9096"]
+    kafka_broker = KafkaBroker(KAFKA_BROKERS)
+    await kafka_broker.start()
+    producer = OrderProducer(kafka_broker, redis)
+
+    order = await producer.create_order(
+        user_id="user_1",
+        items=[
+            {"product_id": "P1", "quantity": 1, "price": 999.99},
+            {"product_id": "P2", "quantity": 2, "price": 29.99}
+        ]
+    )
+
+    print(f"Created order: {order.order_id}")
+    await kafka_broker.stop()
+    await redis.close()
+
+
+
+if __name__ == "__main__":
+    import asyncio
+    from faststream.kafka import KafkaBroker
+
+    asyncio.run(main())
