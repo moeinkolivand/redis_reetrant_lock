@@ -1,4 +1,6 @@
 import json
+from typing import List, Optional
+
 from pydantic import BaseModel
 import redis.asyncio as aioredis
 from faststream.kafka import KafkaBroker
@@ -14,7 +16,7 @@ class OrderCreatedEvent(BaseModel):
     event_type: str
     order_id: str
     user_id: str
-    items: list[dict]
+    items: List[dict]
     total_amount: float
     status: str
     timestamp: str
@@ -24,8 +26,8 @@ class OrderCompletedEvent(BaseModel):
     event_type: str = "order.completed"
     order_id: str
     status: str
-    payment_transaction_id: str | None
-    tracking_number: str | None
+    payment_transaction_id: Optional[str]
+    tracking_number: Optional[str]
     timestamp: str
 
 
@@ -51,7 +53,7 @@ class OrderConsumer:
 
         logger.info(f"Processing order.created event for {order_id}")
 
-        owner_id = f"consumer-{context.get_local('message').partition}"
+        owner_id = f"{message.user_id}"
 
         try:
             success = await self.service.process_order(order_id, owner_id)
