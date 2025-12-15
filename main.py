@@ -1,9 +1,10 @@
 import logging
-from typing import Optional
+from typing import Optional, List
 import redis.asyncio as aioredis
 from faststream.kafka import KafkaBroker
 from faststream import FastStream
-
+from aiokafka.admin import NewTopic, AIOKafkaAdminClient
+from aiokafka.errors import TopicAlreadyExistsError
 from producer import OrderProducer, OrderCreatedEvent, OrderCancelledEvent
 from consumer import OrderConsumer, OrderCompletedEvent, OrderFailedEvent
 from redis_module.redis_seeder import seed_test_data
@@ -11,7 +12,7 @@ from redis_module.redis_seeder import seed_test_data
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-KAFKA_BROKERS: list[str] = ["localhost:9092", "localhost:9094", "localhost:9096"]
+KAFKA_BROKERS: List[str] = ["localhost:9092", "localhost:9094", "localhost:9096"]
 
 kafka_broker = KafkaBroker(KAFKA_BROKERS)
 app = FastStream(kafka_broker)
@@ -19,6 +20,53 @@ app = FastStream(kafka_broker)
 redis_client: Optional[aioredis.Redis] = None
 order_consumer: Optional[OrderConsumer] = None
 
+
+async def create_kafka_topics():
+    """Create Kafka topics if they don't exist."""
+    try:
+        admin_client = AIOKafkaAdminClient(
+            bootstrap_servers=KAFKA_BROKERS,
+            client_id="wallet-app-admin"
+        )
+
+        topics = [
+            NewTopic(
+                name="order.created",
+                num_partitions=3,
+                replication_factor=1
+            ),
+            NewTopic(
+                name="order.completed",
+                num_partitions=3,
+                replication_factor=1
+            ),
+            NewTopic(
+                name="order.cancelled",
+                num_partitions=3,
+                replication_factor=1
+            ),
+            NewTopic(
+                name="order.failed",
+                num_partitions=3,
+                replication_factor=1
+            )
+        ]
+
+        fs = admin_client.create_topics(new_topics=topics, validate_only=False)
+
+        for topic, f in fs.items():
+            try:
+                f.result()
+                logger.info(f"Topic '{topic}' created successfully")
+            except TopicAlreadyExistsError:
+                logger.info(f"Topic '{topic}' already exists")
+            except Exception as e:
+                logger.error(f"Failed to create topic '{topic}': {e}")
+
+        await admin_client.close()
+
+    except Exception as e:
+        logger.error(f"Failed to initialize Kafka admin client: {e}")
 
 async def get_redis() -> aioredis.Redis:
     global redis_client
@@ -36,6 +84,7 @@ async def startup():
     global redis_client, order_consumer
 
     try:
+        await create_kafka_topics()
         redis_client = await aioredis.from_url(
             "redis://localhost:6379/0",
             decode_responses=True,
