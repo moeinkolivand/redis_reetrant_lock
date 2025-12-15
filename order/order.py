@@ -1,4 +1,6 @@
 import asyncio
+from typing import List
+
 import redis.asyncio as aioredis
 from redis_module.redis_reentrant_lock import RedisReentrantLock, reentrant_lock
 import json
@@ -51,7 +53,7 @@ class ShippingStatus(str, Enum):
 class Order:
     """Order entity with nested transaction data."""
 
-    def __init__(self, order_id: str, user_id: str, items: list[dict]):
+    def __init__(self, order_id: str, user_id: str, items: List[dict]):
         self.order_id = order_id
         self.user_id = user_id
         self.items = items
@@ -212,7 +214,7 @@ class OrderProcessingService:
             logger.error(f"{owner_id} Order has no items")
             return False
 
-        user_key = f"user:{order.user_id}"
+        user_key = f"user:{order.user_id}:json"
         user_exists = await self.redis.exists(user_key)
         if not user_exists:
             logger.error(f"{owner_id} User {order.user_id} not found")
